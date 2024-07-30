@@ -1,0 +1,125 @@
+import pandas as pd
+import requests
+from io import StringIO
+import os
+
+def ensure_directory_exists(directory):
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+
+def download_and_process_data(locations):
+    base_url = "https://ntg.aquaticinformatics.net/Export/BulkExport"
+    common_params = ("?DateRange=EntirePeriodOfRecord&TimeZone=9.5&Calendar=CALENDARYEAR&"
+                     "Interval=PointsAsRecorded&Step=1&ExportFormat=csv&TimeAligned=True&"
+                     "RoundData=False&IncludeGradeCodes=False&IncludeApprovalLevels=False&"
+                     "IncludeQualifiers=False&IncludeInterpolationTypes=False")
+    
+    dataset_mapping = {
+        "DepthBelowGround": {
+            "TS": ("DepthBelowGround.Publish", 81),
+            "FV": ("DepthBelowGround.Field Visits", 81)
+        },
+        "WaterElevation": {
+            "TS": ("Water Elevation (AHD).Publish", 82),
+            "FV": ("Water Elevation (AHD).Field Visits", 82)
+        }
+    }
+
+    base_output_dir = 'output/TiTree'
+    ensure_directory_exists(base_output_dir)
+
+    success_list = []
+    failure_list = []
+    
+    for location in locations:
+        for dataset, types in dataset_mapping.items():
+            for dataset_type, (dataset_name, unit_id) in types.items():
+                full_url = (f"{base_url}{common_params}&Datasets[0].DatasetName={dataset_name}%40{location}&"
+                            f"Datasets[0].Calculation=Instantaneous&Datasets[0].UnitId={unit_id}")
+                print(f"Constructed URL for {dataset} ({dataset_type}): {full_url}")
+                
+                try:
+                    response = requests.get(full_url)
+                    response.raise_for_status()
+                    if response.ok:
+                        df = pd.read_csv(StringIO(response.text), skiprows=4, parse_dates=[0], index_col=[0])
+                        print(f"Data for {location} - {dataset} ({dataset_type}):")
+                        print(df.head())  # Print the first few rows of the data for debugging
+                        print(f"Columns for {location} - {dataset} ({dataset_type}): {df.columns.tolist()}")  # Print column names for debugging
+                    else:
+                        print(f"Error fetching data from {full_url}: {response.status_code}")
+                        failure_list.append((location, dataset, dataset_type, f"HTTP Error {response.status_code}"))
+                        continue
+                except requests.exceptions.RequestException as e:
+                    print(f"Error fetching data for {location} from {full_url}: {e}")
+                    failure_list.append((location, dataset, dataset_type, str(e)))
+                    continue
+                except ValueError as ve:
+                    print(f"Value Error for location {location}: {ve}")
+                    failure_list.append((location, dataset, dataset_type, str(ve)))
+                    continue
+                
+                # Look for the 'Value (m)' column
+                if 'Value (m)' in df.columns:
+                    value_column = 'Value (m)'
+                elif 'Value (in)' in df.columns:
+                    value_column = 'Value (in)'
+                    df['Value'] = df[value_column] * 0.0254  # Convert inches to meters
+                else:
+                    print(f"No 'Value (m)' or 'Value (in)' column found in the data for location {location}")
+                    failure_list.append((location, dataset, dataset_type, "No 'Value (m)' or 'Value (in)' column found"))
+                    continue
+                
+                try:
+                    if 'Value (m)' not in df.columns:  # Ensure data is in meters
+                        df = df[['Value']]
+                    else:
+                        df = df[[value_column]].rename(columns={value_column: 'Value'})
+                        
+                    df = df.rename_axis("DateTime").reset_index()
+                    df['Location'] = location
+                    
+                    # Create a directory based on dataset name and type
+                    output_dir = os.path.join(base_output_dir, f"{dataset_name}_{dataset_type}")
+                    ensure_directory_exists(output_dir)
+                    
+                    filename = f"{output_dir}/{location}_{dataset}_{dataset_type}.csv"
+                    df.to_csv(filename, index=False)
+                    print(f"Saved {filename}")
+                    success_list.append(filename)
+                except Exception as e:
+                    print(f"Error processing data for {location} for {dataset} ({dataset_type}): {e}")
+                    failure_list.append((location, dataset, dataset_type, str(e)))
+
+    # Summary of download process
+    print("\nDownload Summary:")
+    print(f"Total files downloaded successfully: {len(success_list)}")
+    for success in success_list:
+        print(f" - {success}")
+
+    print(f"\nTotal files failed to download or process: {len(failure_list)}")
+    for failure in failure_list:
+        location, dataset, dataset_type, error = failure
+        print(f" - Location: {location}, Dataset: {dataset}, Type: {dataset_type}, Error: {error}")
+
+    return success_list, failure_list
+
+# Read bore names from bore_ti_tree.csv
+def get_bore_names_from_csv(file_path):
+    try:
+        df = pd.read_csv(file_path)
+        return df['bore_name'].tolist()
+    except FileNotFoundError:
+        print("The file 'bore_ti_tree.csv' was not found.")
+        return []
+    except pd.errors.EmptyDataError:
+        print("The file 'bore_ti_tree.csv' is empty.")
+        return []
+    except pd.errors.ParserError:
+        print("There was an error parsing 'bore_ti_tree.csv'.")
+        return []
+
+# Example usage
+bore_names = get_bore_names_from_csv('bore_ti_tree.csv')
+if bore_names:
+    download_and_process_data(bore_names)
